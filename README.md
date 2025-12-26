@@ -51,6 +51,16 @@ pomo --work 25 --break 5 --cycles 4
 git clone https://github.com/newbie1223/pomodoro-cli.git
 cd pomodoro-cli
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+## Installation
+
+```bash
+python3 -m venv .venv  
+source .venv/bin/activate  
+pip install -e .  
+```
+
+### Recommended (pipx)
+
+```bash
+pipx install pomo-tui
+```
