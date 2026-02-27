@@ -48,8 +48,10 @@ pomo --work 25 --break 5 --cycles 4
 
 ## 🛠️ Development Setup
 
+```bash
 git clone https://github.com/newbie1223/pomodoro-cli.git
 cd pomodoro-cli
+```
 
 ## Installation
 
