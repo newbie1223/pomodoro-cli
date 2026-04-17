@@ -1,6 +1,6 @@
 [project]
 name = "pomo-tui"
-version = "0.1.1"
+version = "1.01"
 description = "Terminal-based Pomodoro timer with TUI and sound notifications"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -9,6 +9,8 @@ license = { file = "LICENSE" }
 authors = [
   { name = "newbie1223" }
 ]
+
+optional-dependencies = { test = ["pytest>=8.0"] }
 
 [project.scripts]
 pomo = "pomodoro_cli.app:main"
