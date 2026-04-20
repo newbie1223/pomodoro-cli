@@ -1,14 +1,8 @@
 from unittest.mock import patch
 
-from pomodoro_cli.app import (
-    COLOR_BREAK,
-    COLOR_PAUSED,
-    COLOR_WORK,
-    Phase,
-    PomodoroApp,
-    non_negative_int,
-    positive_int,
-)
+from pomodoro_cli.app import PomodoroApp
+from pomodoro_cli.cli import non_negative_int, positive_int
+from pomodoro_cli.models import Phase, PhaseAction
 
 
 class DummyScreen:
@@ -40,6 +34,9 @@ class DummyScreen:
 
     def nodelay(self, enabled: bool) -> None:
         self.calls.append(("nodelay", enabled))
+
+    def timeout(self, value: int) -> None:
+        self.calls.append(("timeout", value))
 
     def getch(self) -> int:
         return -1
@@ -93,18 +90,24 @@ def test_toggle_pause_extends_phase_end_time() -> None:
     assert app.phase_end_time == 106.5
 
 
+def test_help_text_includes_bell_off_marker() -> None:
+    app = PomodoroApp(DummyScreen(), work_min=25, break_min=5, cycles=1, bell_enabled=False)
+
+    assert "bell off" in app._help_text()
+
+
 def test_current_color_returns_paused_color_when_paused() -> None:
     app = PomodoroApp(DummyScreen(), work_min=25, break_min=5, cycles=1)
     app.paused = True
 
-    assert app._current_color(Phase.WORK) == COLOR_PAUSED
+    assert app._current_color(Phase.WORK) == 3
 
 
 def test_current_color_returns_phase_color_when_active() -> None:
     app = PomodoroApp(DummyScreen(), work_min=25, break_min=5, cycles=1)
 
-    assert app._current_color(Phase.WORK) == COLOR_WORK
-    assert app._current_color(Phase.BREAK) == COLOR_BREAK
+    assert app._current_color(Phase.WORK) == 1
+    assert app._current_color(Phase.BREAK) == 2
 
 
 def test_safe_addstr_clips_text_to_screen_width() -> None:
@@ -148,18 +151,72 @@ def test_draw_uses_plain_text_fallback_on_small_screen() -> None:
     assert ("addstr", 3, 3, "01:30") in screen.calls
 
 
+def test_handle_input_can_advance_to_next_phase() -> None:
+    screen = DummyScreen()
+    app = PomodoroApp(screen, work_min=25, break_min=5, cycles=1)
+    screen.getch = lambda: ord("N")
+
+    assert app._handle_input() == PhaseAction.NEXT
+
+
+def test_handle_input_can_reset_session() -> None:
+    screen = DummyScreen()
+    app = PomodoroApp(screen, work_min=25, break_min=5, cycles=3)
+    app.paused = True
+    app.phase_end_time = 999.0
+    screen.getch = lambda: ord("R")
+
+    assert app._handle_input() == PhaseAction.RESET_SESSION
+    assert app.paused is False
+    assert app.phase_end_time == 0.0
+
+
+def test_help_text_mentions_tmux_when_enabled() -> None:
+    screen = DummyScreen()
+    app = PomodoroApp(screen, work_min=25, break_min=5, cycles=1)
+    app.is_tmux = True
+
+    assert "tmux" in app._help_text()
+
+
 def test_run_phase_exits_when_timer_reaches_zero() -> None:
     screen = DummyScreen()
     app = PomodoroApp(screen, work_min=25, break_min=5, cycles=1)
 
     with (
-        patch.object(app, "_beep"),
-        patch.object(app, "_handle_input"),
+        patch.object(app, "_notify_phase_change"),
+        patch.object(app, "_handle_input", side_effect=[PhaseAction.CONTINUE, PhaseAction.CONTINUE]),
         patch.object(app, "_draw") as draw_mock,
         patch("pomodoro_cli.app.time.time", side_effect=[100.0, 100.0, 101.0]),
         patch("pomodoro_cli.app.time.sleep"),
     ):
-        app._run_phase(Phase.WORK, 1)
+        result = app._run_phase(Phase.WORK, 1)
 
+    assert result == PhaseAction.CONTINUE
     draw_mock.assert_any_call(Phase.WORK, 1)
     draw_mock.assert_any_call(Phase.WORK, 0)
+
+
+def test_run_phase_returns_next_action() -> None:
+    screen = DummyScreen()
+    app = PomodoroApp(screen, work_min=25, break_min=5, cycles=1)
+
+    with (
+        patch.object(app, "_notify_phase_change"),
+        patch.object(app, "_handle_input", return_value=PhaseAction.NEXT),
+        patch.object(app, "_draw"),
+    ):
+        result = app._run_phase(Phase.WORK, 10)
+
+    assert result == PhaseAction.NEXT
+
+
+def test_show_completion_message_renders_summary() -> None:
+    screen = DummyScreen()
+    app = PomodoroApp(screen, work_min=25, break_min=5, cycles=2)
+    app.current_cycle = 2
+
+    app._show_completion_message()
+
+    assert any(call[0] == "addstr" and "Session complete!" in call[3] for call in screen.calls)
+

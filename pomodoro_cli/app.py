@@ -1,174 +1,134 @@
-import argparse
 import curses
+import os
 import time
-from enum import Enum, auto
 
+from .config import (
+    COLOR_BREAK,
+    COLOR_PAUSED,
+    COLOR_WORK,
+    DIGITS,
+    DIGIT_GAP,
+    DIGIT_HEIGHT,
+    DIGIT_WIDTH,
+    FPS_ACTIVE,
+    FPS_PAUSED,
+    INPUT_POLL_TIMEOUT_MS,
+)
+from .models import Phase, PhaseAction, SessionStats
 
-# ======================
-# Configuration
-# ======================
-
-FPS_ACTIVE = 1.0
-FPS_PAUSED = 0.1
-
-DIGIT_HEIGHT = 5
-DIGIT_WIDTH = 8
-DIGIT_GAP = 1
-
-
-class Phase(Enum):
-    WORK = auto()
-    BREAK = auto()
-
-
-COLOR_WORK = 1
-COLOR_BREAK = 2
-COLOR_PAUSED = 3
-
-
-DIGITS = {
-    "0": [
-        " ██████ ",
-        "██    ██",
-        "██    ██",
-        "██    ██",
-        " ██████ ",
-    ],
-    "1": [
-        "   ██   ",
-        " ████   ",
-        "   ██   ",
-        "   ██   ",
-        " ██████ ",
-    ],
-    "2": [
-        " ██████ ",
-        "      ██",
-        " ██████ ",
-        "██      ",
-        " ██████ ",
-    ],
-    "3": [
-        " ██████ ",
-        "      ██",
-        " ██████ ",
-        "      ██",
-        " ██████ ",
-    ],
-    "4": [
-        "██    ██",
-        "██    ██",
-        " ██████ ",
-        "      ██",
-        "      ██",
-    ],
-    "5": [
-        " ██████ ",
-        "██      ",
-        " ██████ ",
-        "      ██",
-        " ██████ ",
-    ],
-    "6": [
-        " ██████ ",
-        "██      ",
-        " ██████ ",
-        "██    ██",
-        " ██████ ",
-    ],
-    "7": [
-        " ██████ ",
-        "      ██",
-        "      ██",
-        "      ██",
-        "      ██",
-    ],
-    "8": [
-        " ██████ ",
-        "██    ██",
-        " ██████ ",
-        "██    ██",
-        " ██████ ",
-    ],
-    "9": [
-        " ██████ ",
-        "██    ██",
-        " ██████ ",
-        "      ██",
-        " ██████ ",
-    ],
-    ":": [
-        "        ",
-        "   ██   ",
-        "        ",
-        "   ██   ",
-        "        ",
-    ],
-}
-
-
-# ======================
-# Pomodoro Application
-# ======================
 
 class PomodoroApp:
-    def __init__(self, stdscr, work_min: int, break_min: int, cycles: int):
+    def __init__(
+        self,
+        stdscr,
+        work_min: int,
+        break_min: int,
+        cycles: int,
+        bell_enabled: bool = True,
+    ):
         self.stdscr = stdscr
         self.work_sec = work_min * 60
         self.break_sec = break_min * 60
         self.cycles = cycles
+        self.bell_enabled = bell_enabled
 
         self.paused = False
         self.pause_started_at = 0.0
         self.phase_end_time = 0.0
+        self.current_cycle = 0
+        self.is_tmux = "TMUX" in os.environ
 
     # ---------- lifecycle ----------
 
     def run(self) -> None:
         self._init_curses()
 
-        cycle = 0
-        while self.cycles == 0 or cycle < self.cycles:
-            self._run_phase(Phase.WORK, self.work_sec)
-            self._run_phase(Phase.BREAK, self.break_sec)
-            cycle += 1
+        while True:
+            self.current_cycle = 0
+            self._run_session()
+
+            if not self._wait_after_completion():
+                return
+
+    def _run_session(self) -> None:
+        while self.cycles == 0 or self.current_cycle < self.cycles:
+            work_action = self._run_phase(Phase.WORK, self.work_sec)
+            if work_action == PhaseAction.RESET_SESSION:
+                return
+
+            break_action = self._run_phase(Phase.BREAK, self.break_sec)
+            if break_action == PhaseAction.RESET_SESSION:
+                return
+
+            self.current_cycle += 1
+
+        self._show_completion_message()
+
+    def _wait_after_completion(self) -> bool:
+        while True:
+            action = self._handle_input()
+            if action == PhaseAction.RESET_SESSION:
+                self._reset_session()
+                return True
 
     def _init_curses(self) -> None:
         curses.curs_set(0)
-        self.stdscr.nodelay(True)
+        self.stdscr.nodelay(False)
+        self.stdscr.timeout(INPUT_POLL_TIMEOUT_MS)
+        curses.set_escdelay(25)
 
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(COLOR_WORK, curses.COLOR_RED, -1)
-        curses.init_pair(COLOR_BREAK, curses.COLOR_BLUE, -1)
-        curses.init_pair(COLOR_PAUSED, curses.COLOR_YELLOW, -1)
+        if hasattr(curses, "start_color"):
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(COLOR_WORK, curses.COLOR_RED, -1)
+            curses.init_pair(COLOR_BREAK, curses.COLOR_BLUE, -1)
+            curses.init_pair(COLOR_PAUSED, curses.COLOR_YELLOW, -1)
 
     # ---------- phase control ----------
 
-    def _run_phase(self, phase: Phase, duration: int) -> None:
-        self._beep()
+    def _run_phase(self, phase: Phase, duration: int) -> PhaseAction:
+        self._notify_phase_change()
+        self._start_phase(duration)
 
+        while True:
+            action = self._handle_input()
+            if action != PhaseAction.CONTINUE:
+                return action
+
+            remaining = self._remaining_time()
+            self._draw(phase, remaining)
+
+            if remaining == 0:
+                return PhaseAction.CONTINUE
+
+            time.sleep(FPS_PAUSED if self.paused else FPS_ACTIVE)
+
+    def _start_phase(self, duration: int) -> None:
         self.phase_end_time = time.time() + duration
         self.paused = False
         self.pause_started_at = 0.0
 
-        while True:
-            self._handle_input()
-
-            remaining = max(0, int(self.phase_end_time - time.time()))
-            self._draw(phase, remaining)
-
-            if remaining == 0:
-                return
-
-            time.sleep(FPS_PAUSED if self.paused else FPS_ACTIVE)
+    def _remaining_time(self) -> int:
+        return max(0, int(self.phase_end_time - time.time()))
 
     # ---------- input ----------
 
-    def _handle_input(self) -> None:
-        key = self.stdscr.getch()
-        if key == ord("p"):
-            self._toggle_pause()
+    def _handle_input(self) -> PhaseAction:
+        while True:
+            key = self.stdscr.getch()
+            if key == -1:
+                return PhaseAction.CONTINUE
+            if key == curses.KEY_RESIZE:
+                curses.update_lines_cols()
+                continue
+            if key == ord("p"):
+                self._toggle_pause()
+                continue
+            if key == ord("N"):
+                return PhaseAction.NEXT
+            if key == ord("R"):
+                self._reset_session()
+                return PhaseAction.RESET_SESSION
 
     def _toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -179,38 +139,55 @@ class PomodoroApp:
         pause_duration = time.time() - self.pause_started_at
         self.phase_end_time += pause_duration
 
+    def _reset_session(self) -> None:
+        self.paused = False
+        self.pause_started_at = 0.0
+        self.phase_end_time = 0.0
+
     # ---------- drawing ----------
 
     def _draw(self, phase: Phase, remaining: int) -> None:
         self.stdscr.clear()
-        h, w = self.stdscr.getmaxyx()
+        height, width = self.stdscr.getmaxyx()
 
         time_str = self._format_time(remaining)
         color = self._current_color(phase)
+        time_y = self._draw_timer(height, width, time_str, color)
 
+        status = "PAUSED" if self.paused else self._phase_label(phase)
+        status_y = min(height - 3, time_y + DIGIT_HEIGHT + 1)
+        self._draw_status(status, status_y, width, color)
+
+        self._draw_session_summary(width)
+        self._safe_addstr(height - 2, 2, self._help_text())
+        self.stdscr.refresh()
+
+    def _draw_timer(self, height: int, width: int, time_str: str, color: int) -> int:
         time_width = len(time_str) * DIGIT_WIDTH + (len(time_str) - 1) * DIGIT_GAP
-        time_y = max(0, h // 2 - DIGIT_HEIGHT)
-        time_x = max(0, w // 2 - time_width // 2)
+        time_y = max(0, height // 2 - DIGIT_HEIGHT)
+        time_x = max(0, width // 2 - time_width // 2)
 
-        if h >= DIGIT_HEIGHT + 3 and w >= time_width:
-            self._draw_time(
-                time_str,
-                y=time_y,
-                x=time_x,
-                color=color,
-            )
+        if height >= DIGIT_HEIGHT + 3 and width >= time_width:
+            self._draw_time(time_str, y=time_y, x=time_x, color=color)
         else:
             self._safe_addstr(
-                max(0, h // 2),
-                max(0, w // 2 - len(time_str) // 2),
+                max(0, height // 2),
+                max(0, width // 2 - len(time_str) // 2),
                 time_str,
                 color,
             )
 
-        status = "PAUSED" if self.paused else self._phase_label(phase)
-        self._draw_status(status, min(h - 3, time_y + DIGIT_HEIGHT + 1), w, color)
-        self._safe_addstr(h - 2, 2, "p: pause/resume | Ctrl+C: quit")
-        self.stdscr.refresh()
+        return time_y
+
+    def _draw_session_summary(self, width: int) -> None:
+        stats = self._session_stats()
+        left = f"cycle {stats.current_cycle_label}"
+        center = f"done {stats.progress_percent}"
+        right = f"remaining {stats.remaining_cycles_label}"
+
+        self._safe_addstr(1, 2, left)
+        self._safe_addstr(1, max(2, width // 2 - len(center) // 2), center)
+        self._safe_addstr(1, max(2, width - len(right) - 2), right)
 
     def _draw_time(self, time_str: str, y: int, x: int, color: int) -> None:
         self.stdscr.attron(curses.color_pair(color))
@@ -227,7 +204,38 @@ class PomodoroApp:
         x = max(0, width // 2 - len(text) // 2)
         self._safe_addstr(y, x, text, color)
 
+    def _show_completion_message(self) -> None:
+        self.stdscr.clear()
+        height, width = self.stdscr.getmaxyx()
+        stats = self._session_stats()
+        lines = [
+            "Session complete!",
+            f"Completed cycles: {stats.completed_cycles}",
+            "Press R to restart or Ctrl+C to quit.",
+        ]
+
+        start_y = max(0, height // 2 - len(lines) // 2)
+        for index, line in enumerate(lines):
+            x = max(0, width // 2 - len(line) // 2)
+            self._safe_addstr(start_y + index, x, line)
+
+        self.stdscr.refresh()
+
     # ---------- helpers ----------
+
+    def _session_stats(self) -> SessionStats:
+        return SessionStats(
+            completed_cycles=self.current_cycle,
+            total_cycles=self.cycles,
+        )
+
+    def _help_text(self) -> str:
+        base = "p pause | N next | R reset | Ctrl+C quit"
+        if not self.bell_enabled:
+            base += " | bell off"
+        if self.is_tmux:
+            base += " | tmux: send keys directly"
+        return base
 
     def _safe_addch(self, y: int, x: int, ch: str) -> None:
         if y < 0 or x < 0:
@@ -278,49 +286,6 @@ class PomodoroApp:
             return COLOR_PAUSED
         return COLOR_WORK if phase == Phase.WORK else COLOR_BREAK
 
-    @staticmethod
-    def _beep() -> None:
-        print("\a", end="", flush=True)
-
-
-# ======================
-# Entry Point
-# ======================
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be a positive integer")
-    return parsed
-
-
-def non_negative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be zero or a positive integer")
-    return parsed
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="CLI Pomodoro Timer")
-    parser.add_argument("--work", type=positive_int, default=25)
-    parser.add_argument("--break", dest="break_", type=positive_int, default=5)
-    parser.add_argument(
-        "--cycles",
-        type=non_negative_int,
-        default=0,
-        help="Number of work/break cycles to run. Use 0 for infinite.",
-    )
-    args = parser.parse_args()
-
-    try:
-        curses.wrapper(
-            lambda stdscr: PomodoroApp(
-                stdscr,
-                args.work,
-                args.break_,
-                args.cycles,
-            ).run()
-        )
-    except KeyboardInterrupt:
-        pass
+    def _notify_phase_change(self) -> None:
+        if self.bell_enabled:
+            print("\a", end="", flush=True)
